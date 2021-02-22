@@ -4,18 +4,16 @@ import argparse
 
 import torch
 import scipy.ndimage as ndi
-from pylab import *
 from torch import nn, optim, autograd
 import gopen, paths, utils, filters
 import helpers
 from torch.autograd import Variable
 import diymodel
 import traceback
+import numpy as np
 
 default_degrade = "translation=0.03, rotation=1.0, scale=0.03, aniso=0.03"
 
-rc("image", cmap="gray")
-ion()
 
 parser = argparse.ArgumentParser("train a page segmenter")
 parser.add_argument("-l", "--lr", default="0,0.03:3e5,0.01:1e6,0.003",
@@ -167,7 +165,7 @@ def zoom_like(image, shape):
     h, w = shape
     image = helpers.asnd(image)
     ih, iw = image.shape
-    scale = diag([ih * 1.0/h, iw * 1.0/w])
+    scale = np.diag([ih * 1.0/h, iw * 1.0/w])
     return ndi.affine_transform(image, scale, output_shape=(h, w), order=1)
 
 
@@ -179,9 +177,9 @@ def zoom_like_batch(batch, shape):
         result = []
         for j in range(d):
             result.append(zoom_like(batch[i, :, :, j], (oh, ow)))
-        result = array(result).transpose(1, 2, 0)
+        result = np.array(result).transpose(1, 2, 0)
         batch_result.append(result)
-    result = array(batch_result)
+    result = np.array(batch_result)
     return result
 
 
@@ -213,7 +211,7 @@ def display_batch(image, target, output, mask=None):
         subplot(132)
         imshow(output[0, :, :, 0])
     if mask is not None:
-        overlay = array([target[0, :, :, 0], target[0, :, :, 0],
+        overlay = np.array([target[0, :, :, 0], target[0, :, :, 0],
                          mask[0, :, :, 0]], 'f').transpose(1, 2, 0)
         subplot(133)
         imshow(overlay)
