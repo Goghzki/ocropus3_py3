@@ -1,0 +1,260 @@
+#!/usr/bin/python
+import sys
+import argparse
+
+import torch
+import scipy.ndimage as ndi
+from pylab import *
+from torch import nn, optim, autograd
+import gopen, paths, utils, filters
+import helpers
+from torch.autograd import Variable
+import diymodel
+import traceback
+
+default_degrade = "translation=0.03, rotation=1.0, scale=0.03, aniso=0.03"
+
+rc("image", cmap="gray")
+ion()
+
+parser = argparse.ArgumentParser("train a page segmenter")
+parser.add_argument("-l", "--lr", default="0,0.03:3e5,0.01:1e6,0.003",
+                    help="learning rate or learning rate sequence 'n,lr:n,lr:n,:r'")
+parser.add_argument("-b", "--batchsize", type=int, default=1)
+parser.add_argument("-o", "--output", default="temp", help="prefix for output")
+parser.add_argument("-m", "--model", default=None, help="load model")
+parser.add_argument("-d", "--input", default="uw3-framed-lines.tgz")
+
+parser.add_argument("--maxtrain", type=int, default=10000000)
+parser.add_argument("--degrade", default=default_degrade,
+                    type=str, help="degradation parameters")
+parser.add_argument("--erange", default=20, type=int,
+                    help="line emphasis range")
+parser.add_argument("--scale", default=1.0, type=float,
+                    help="rescale prior to training")
+parser.add_argument("--save_every", default=1000,
+                    type=int, help="how often to save")
+parser.add_argument("--loss_horizon", default=1000, type=int,
+                    help="horizon over which to calculate the loss")
+parser.add_argument("--dilate_target", default=0, type=int,
+                    help="extra dilation for target")
+parser.add_argument("--dilate_mask", default="(30,150)",
+                    help="dilate of target to make mask")
+parser.add_argument("--mask_background", default=0.0,
+                    type=float, help="background weight for mask")
+parser.add_argument("--ntrain", type=int, default=-
+                    1, help="ntrain starting value")
+parser.add_argument("--display", type=int, default=10,
+                    help="how often to display samples and outputs")
+parser.add_argument("--complexity", type=int, default=10,
+                    help="base model complexity")
+
+args = parser.parse_args()
+ARGS = {k: v for k, v in args.__dict__.items()}
+
+
+def make_source():
+    # return  gopen.open_source("zsub://localhost:10000/")
+    f = filters.ren({"png": "framed.png", "lines.png": "lines.png"})
+    return f(gopen.open_source(args.input))
+
+
+def make_pipeline():
+
+    def transformer(sample):
+        sample["png"] = sample["png"][:,:,0]
+        sample["lines.png"] = sample["lines.png"][:,:,0]
+        if "mask.png" not in sample:
+            mask = ndi.maximum_filter(
+                sample["lines.png"], eval(args.dilate_mask))
+            mask = np.maximum(mask, args.mask_background)
+            sample["mask.png"] = mask
+        sample["png"] = np.expand_dims(sample["png"], 2)
+        sample["lines.png"] = np.expand_dims(sample["lines.png"], 2)
+        sample["mask.png"] = np.expand_dims(sample["mask.png"], 2)
+        return sample
+
+    return filters.compose(
+        filters.shuffle(500, 10),
+        filters.transform(transformer),
+        filters.rename(input="png", output="lines.png", mask="mask.png"),
+        filters.batched(args.batchsize))
+
+
+def pixels_to_batch(x):
+    b, d, h, w = x.size()
+    return x.permute(0, 2, 3, 1).contiguous().view(b*h*w, d)
+
+
+class WeightedGrad(autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input, weights):
+        ctx.save_for_backward(input, weights)
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weights = ctx.saved_tensors
+        return grad_output * weights
+
+
+def weighted_grad(x, y):
+    return WeightedGrad.apply(x, y)
+
+
+class PixelsToBatch(nn.Module):
+    def forward(self, x):
+        return pixels_to_batch(x)
+
+# FIXME replace with version in dltrainers
+
+
+class LearningRateSchedule(object):
+    def __init__(self, schedule):
+        if ":" in schedule:
+            self.learning_rates = [
+                [float(y) for y in x.split(",")] for x in schedule.split(":")]
+            assert self.learning_rates[0][0] == 0
+        else:
+            lr0 = float(schedule)
+            self.learning_rates = [[0, lr0]]
+
+    def __call__(self, count):
+        _, lr = self.learning_rates[0]
+        for n, l in self.learning_rates:
+            if count < n:
+                break
+            lr = l
+        return lr
+
+
+source = make_source()
+sample = source.__next__()
+
+print ("raw sample:")
+utils.print_sample(sample)
+
+pipeline = make_pipeline()
+source = pipeline(source)
+sample = source.__next__()
+
+print ("preprocessed sample:")
+utils.print_sample(sample)
+if args.model:
+    model = torch.load(args.model)
+    ntrain, _ = paths.parse_save_path(args.model)
+else:
+    model = diymodel.LayoutModel(args.complexity)
+    ntrain = 0
+model.cuda()
+if args.ntrain >= 0:
+    ntrain = args.ntrain
+print ("ntrain", ntrain)
+
+print ("model:")
+print (model)
+
+start_count = 0
+
+criterion = nn.MSELoss()
+criterion.cuda()
+
+losses = [1.0]
+
+
+def zoom_like(image, shape):
+    h, w = shape
+    image = helpers.asnd(image)
+    ih, iw = image.shape
+    scale = diag([ih * 1.0/h, iw * 1.0/w])
+    return ndi.affine_transform(image, scale, output_shape=(h, w), order=1)
+
+
+def zoom_like_batch(batch, shape):
+    b, h, w, d = batch.shape
+    oh, ow = shape
+    batch_result = []
+    for i in range(b):
+        result = []
+        for j in range(d):
+            result.append(zoom_like(batch[i, :, :, j], (oh, ow)))
+        result = array(result).transpose(1, 2, 0)
+        batch_result.append(result)
+    result = array(batch_result)
+    return result
+
+
+def train_batch(model, image, target, mask=None, lr=1e-3):
+    cuinput = torch.FloatTensor(image.transpose(0, 3, 1, 2)).cuda()
+    optimizer = optim.SGD(model.parameters(), lr=lr,
+                          momentum=0.9, weight_decay=0.0)
+    optimizer.zero_grad()
+    cuoutput = model(Variable(cuinput))
+    b, d, h, w = cuoutput.size()
+    if mask is not None:
+        mask = zoom_like_batch(mask, (h, w))
+        cumask = torch.FloatTensor(mask.transpose(0, 3, 1, 2)).cuda()
+        coutput = weighted_grad(cuoutput, Variable(cumask))
+    target = zoom_like_batch(target, (h, w))
+    cutarget = Variable(torch.FloatTensor(target.transpose(0, 3, 1, 2)).cuda())
+    loss = criterion(pixels_to_batch(cuoutput), pixels_to_batch(cutarget))
+    loss.backward()
+    optimizer.step()
+    return loss.item(), helpers.asnd(cuoutput).transpose(0, 2, 3, 1)
+
+
+def display_batch(image, target, output, mask=None):
+    clf()
+    if image is not None:
+        subplot(131)
+        imshow(image[0, :, :, 0])
+    if output is not None:
+        subplot(132)
+        imshow(output[0, :, :, 0])
+    if mask is not None:
+        overlay = array([target[0, :, :, 0], target[0, :, :, 0],
+                         mask[0, :, :, 0]], 'f').transpose(1, 2, 0)
+        subplot(133)
+        imshow(overlay)
+        title("mask range {}".format(amin(mask), amax(mask)))
+    else:
+        subplot(133)
+        imshow(target[0, :, :, 0])
+    draw()
+    ginput(1, 1e-3)
+
+
+losses = []
+rates = LearningRateSchedule(args.lr)
+nbatches = 0
+import gc
+
+for sample in source:
+    fname = sample["__key__"]
+    image = sample["input"]
+    target = sample["output"]
+    mask = sample.get("mask")
+    lr = rates(ntrain)
+    try:
+        loss, output = train_batch(model, image, target, mask, lr)
+    except Exception as e:
+        utils.print_sample(sample)
+        print (e)
+        continue
+    losses.append(loss)
+    print (nbatches, ntrain, sample["__key__"],)
+    print (loss, fname, np.amin(output), np.amax(output), "lr", lr)
+    if nbatches > 0 and nbatches % args.save_every == 0:
+        err = float(np.mean(losses[-args.save_every:]))
+        fname = paths.make_save_path(args.output, ntrain, err)
+        torch.save(model, fname)
+        print ("saved", fname)
+    if args.display > 0 and nbatches % args.display == 0:
+        display_batch(image, target, output, mask)
+    nbatches += 1
+    ntrain += len(image)
+    if ntrain >= args.maxtrain:
+        break
+    sys.stdout.flush()
+    sys.stderr.flush()
