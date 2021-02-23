@@ -8,7 +8,7 @@ import numpy as np
 model = torch.load("/content/temp-000000000-059442.pt")
 model.cuda()
 model.eval()
-image = cv2.imread("/content/image/A00LBIN.png", cv2.IMREAD_GRAYSCALE)
+image = 1. - cv2.imread("/content/1.png", cv2.IMREAD_GRAYSCALE)/255.
 H, W = image.shape
 image= image.reshape(1,1,H,W)
 print (image)
